@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2025-03-24 03:01:44 by Eclipse SUMO sumo Version 1.22.0
+-->
+
+<sumoConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <!-- 130s環境 -->
+        <!-- <net-file value="toyama_shouwa_offset_smz.net.xml"/> -->
+        <!-- 120s環境 -->
+        <!-- <net-file value="toyama_shouwa_offset.net.xml"/> -->
+        <!-- <net-file value="11.08_zennkouhann.net.xml"/> -->
+
+        <!-- 新町モデル -->
+        <!-- <net-file value="shin_11.12shuusei.net.xml"/> -->
+
+        <!-- 卒論用 -->
+        <net-file value="sotsuronnkannkyou_1.16.net.xml"/>
+
+        
+        <!-- ギャップ感応 -->
+        <!-- <net-file value="gap_toyama_shouwa_offset.net.xml"/>
+        <additional-files value="detectors.add.xml"/> -->
+
+        <!-- 新環境_ギャップ感応 -->
+        <!-- <net-file value="gap_shinkankyou.net.xml"/> -->
+        <additional-files value="detectors.add.xml"/>
+
+        <route-files value="random_trips_with_highway.rou.xml"/>
+        
+    </input>
+
+    <time>
+        <begin value="0"/>
+        <end value="90000"/>
+    </time>
+ 
+    <processing>
+        <time-to-teleport value="-1"/>
+    </processing>
+
+</sumoConfiguration>
