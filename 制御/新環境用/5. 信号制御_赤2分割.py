@@ -20,16 +20,42 @@ from sklearn.preprocessing import MinMaxScaler
 import warnings
 import joblib
 
+# ============================================================================
+# 【赤2分割GNN 信号制御】 4. 信号制御_赤3分割.py の2分割版
+# ----------------------------------------------------------------------------
+# 3分割版との違いは次の3点だけ。他（サイクル長スケジュール、J交差点の青更新方式、
+# 遅れ時間・待ち台数の全信号集計、ギャップ感応制御、時間距離図、各種ログ）は同一。
+#   ① 予測モデル: 予測モデル/1. 赤時間2分割/道路{1,5}_分散評価あり
+#                  [前半,後半] → 次サイクルの [前半,後半]（2入力2出力）
+#   ② 計測      : 赤を2等分（RedSplit2Tracker）。3分割版と同じ初停車ビン方式。
+#   ③ delta     : 旧2分割制御（1. 信号制御用_従道路も.py）の規則
+#                  t3>t4 → +t3*2 / t3<t4 → −t4*2 / 同数 → 0（±10sクランプ）
+#
+# ★サイクル長は案A（最新プログラムどおり時間帯別 100〜130s）を採用。
+#   2分割モデルの学習データ(12.22)は130s固定サイクルで計測されているため、赤の絶対長は
+#   学習時と変わる。モデルは「赤を2等分した各区間の台数」を見るので比は保たれるが、
+#   学習条件に厳密に合わせたい場合は 赤2分割_制御コア.py の CYCLE_SCHEDULE_BY_HOUR を
+#   全時間帯130sにすること（比較対象の none/gap も同条件で回し直す必要がある）。
+#
+# 環境変数（3分割版の R3_* に対応する R2_*）:
+#   R2_MODE=prediction|gap|pgap|pgapmin|npred|none   制御モード
+#   R2_VARIANT=red2|none                             予測制御の有効/無効
+#   R2_MODEL1 / R2_MODEL5                            使用するモデルフォルダ名
+#   R2_EVENCANCEL=1                                  旧2分割の奇数制御/偶数打ち消しにする
+#   R2_DEADBAND=2                                    前半後半の差がこの台数未満なら delta=0
+#   R2_END / R2_GUI / R2_GAPSHORT                    終了時刻 / GUI / 予測ギャップ閾値
+# ============================================================================
+
 # ============================================================
-# 赤3分割制御コア（検証済みモジュール）を読み込む
-#   ・モデル(RedSplitPredictionGNN) / 予測(run_prediction_red3) / delta(delta_variant)
-#   ・赤3分割の実時間計測(RedSplit3Tracker, 初停車ビン方式)
-#   ・時間帯別サイクル長(get_target_cycle / build_scaled_logic)
+# 赤2分割制御コアを読み込む
+#   ・モデル(RedSplitPredictionGNN) / 予測(run_prediction_red2) / delta(delta_red2)
+#   ・赤2分割の実時間計測(RedSplit2Tracker, 初停車ビン方式)
+#   ・時間帯別サイクル長(get_target_cycle / build_scaled_logic) ※3分割コアと共用
 # ============================================================
-_core_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "赤3分割_制御コア.py")
-_spec = importlib.util.spec_from_file_location("red3_core", _core_path)
-red3 = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(red3)
+_core_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "赤2分割_制御コア.py")
+_spec = importlib.util.spec_from_file_location("red2_core", _core_path)
+red2 = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(red2)
 
 # 到着間隔（W・N同時予測）コア: 予測ギャップ制御(pgap)で使用
 _arr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "到着間隔_制御コア.py")
@@ -39,14 +65,76 @@ _arr_spec.loader.exec_module(arr)
 
 # ============================================================
 # 制御案の選択（比較実験用フラグ）
-#   "none": 制御なし / "1": 最大区間 / "2A": 前半重視 / "2B": 後半重視 / "3": 重みA×合計中央値
+#   "red2": 旧2分割制御の規則で delta を決める / "none": delta=0（予測はするが動かさない）
 #   ※ CONTROL_MODE="prediction" のときのみ有効。CONTROL_MODE="none"/"gap" はこのフラグを無視。
+#   3分割版のような複数案（1/2A/2B/3）は無い。2区間なので規則が1つしかないため。
 # ============================================================
-CONTROL_VARIANT = os.environ.get("R3_VARIANT", "2A")   # none/1/2A/2B/3（環境変数 R3_VARIANT で上書き可）
+CONTROL_VARIANT = os.environ.get("R2_VARIANT", "red2")   # red2/none（環境変数 R2_VARIANT で上書き可）
 
-# 予測ギャップ(pgap)の緩めたギャップ閾値(秒)。R3_GAPSHORT で上書き可（既定2s）。
+# === delta の決め方 ===
+#   "weighted"(既定) … ギャップ感応と同じく「初期状態 = BASE − 10s」から始め、
+#                       予測台数に応じて足す:
+#                         delta = -10 + (前半予測 × X1 + 後半予測 × X2) × 2
+#                       重み付き台数 0台→BASE−10s、5台→BASE、10台→BASE+10s（上限）。
+#   "compare"        … 旧2分割制御の規則（t3>t4 → +t3*2 / t3<t4 → −t4*2）。過去結果の再現用。
+DELTA_RULE = os.environ.get("R2_RULE", "weighted")
+DELTA_X1 = float(os.environ.get("R2_X1", str(red2.X1_DEFAULT)))   # 前半(t3)の重み
+DELTA_X2 = float(os.environ.get("R2_X2", str(red2.X2_DEFAULT)))   # 後半(t4)の重み
+
+# --- 交通量の多い時間帯だけ重みを上げる ---
+# ピーク時は需要が大きく、通常の重み（x<1）では delta が上限に届かず主道路へ十分な青を
+# 配分できない。そこでピーク時間帯に限り x1 を X1_MAX_PEAK(=1.5) まで上げられるようにする。
+# 既定のピーク時間帯 = サイクル長が最長(130s)に設定されている時間帯（7-8時, 17-19時）。
+#   R2_PEAK_HOURS="6-19"   のように時間帯を直接指定することもできる（複数は , 区切り）
+#   R2_X1_PEAK / R2_X2_PEAK でピーク時の重みを指定（既定はピークも通常と同じ）
+_max_cycle = max(c for _, _, c in red2.CYCLE_SCHEDULE_BY_HOUR)
+_default_peak = ",".join(f"{a}-{b}" for a, b, c in red2.CYCLE_SCHEDULE_BY_HOUR if c == _max_cycle)
+PEAK_HOURS_SPEC = os.environ.get("R2_PEAK_HOURS", _default_peak)
+PEAK_RANGES = []
+for _part in PEAK_HOURS_SPEC.split(","):
+    _part = _part.strip()
+    if not _part:
+        continue
+    _a, _b = _part.split("-")
+    PEAK_RANGES.append((float(_a), float(_b)))
+
+DELTA_X1_PEAK = float(os.environ.get("R2_X1_PEAK", str(DELTA_X1)))
+DELTA_X2_PEAK = float(os.environ.get("R2_X2_PEAK", str(DELTA_X2)))
+USE_PEAK_WEIGHTS = (DELTA_X1_PEAK != DELTA_X1) or (DELTA_X2_PEAK != DELTA_X2)
+
+if DELTA_RULE == "weighted":
+    red2.validate_weights(DELTA_X1, DELTA_X2)                      # 通常: 0 < x1 < 1
+    red2.validate_weights(DELTA_X1_PEAK, DELTA_X2_PEAK, peak=True)  # ピーク: x1 は 1.5 まで可
+
+
+def weights_at(step):
+    """その時刻に使う (x1, x2) を返す。ピーク時間帯なら ピーク用の重み。"""
+    if not USE_PEAK_WEIGHTS:
+        return DELTA_X1, DELTA_X2
+    h = (float(step) - PREP_TIME) / 3600.0
+    for a, b in PEAK_RANGES:
+        if a <= h < b:
+            return DELTA_X1_PEAK, DELTA_X2_PEAK
+    return DELTA_X1, DELTA_X2
+
+# delta のデッドバンド(台): 旧ルール("compare")のみ有効。前半と後半の差がこの台数未満なら delta=0。
+DELTA_DEADBAND = int(os.environ.get("R2_DEADBAND", "0"))
+
+# 旧2分割制御の「奇数サイクル=予測で制御 / 偶数サイクル=前サイクルの打ち消し」を使うか。
+# 既定 0（毎サイクル制御＋累積オフセット補正 = 3分割版と同じ方式）。
+# ※ 2分割の delta は「赤の前半に多く停まる」傾向のため正（青延長）に偏りやすい。
+#   学習データのテスト日で試算すると delta 平均は 道路1=+3.5s / 道路5=+3.0s（道路5は負が0回）。
+#   旧プログラムが偶数サイクルで打ち消していたのは、この偏りを相殺するためと思われる。
+#   既定の累積オフセット補正でもドリフトは抑制されるが、挙動を比べたい場合は R2_EVENCANCEL=1。
+EVEN_CYCLE_CANCEL_PRED = os.environ.get("R2_EVENCANCEL", "0") == "1"
+
+# 予測ギャップ(pgap)の緩めたギャップ閾値(秒)。R2_GAPSHORT で上書き可（既定2s）。
 # 大きくするほど「本物でない一時的な隙間での早切り＝積み残し」を減らせる（安全マージン）。
-PGAP_GAP_SHORT = int(os.environ.get("R3_GAPSHORT", "2"))
+PGAP_GAP_SHORT = int(os.environ.get("R2_GAPSHORT", "2"))
+
+# 使用する予測モデルのフォルダ名（予測モデル/1. 赤時間2分割/ 配下）
+MODEL_DIR_ROAD1 = os.environ.get("R2_MODEL1", "道路1_分散評価あり")
+MODEL_DIR_ROAD5 = os.environ.get("R2_MODEL5", "道路5_分散評価あり")
 
 
 shown_warnings = set()
@@ -66,12 +154,12 @@ def get_time_label_and_step(step, total_steps_in_day=1330, num_classes=5, prep_t
 
 
 # ============================================================
-# 赤3分割の予測（コアモジュールに委譲）
-#   wait_9x3: 全9道路の当該サイクル3分割 [9,3]（実台数）
-#   戻り: 対象道路の次サイクル [t4,t5,t6]（実台数）
+# 赤2分割の予測（コアモジュールに委譲）
+#   wait_9x2: 全9道路の当該サイクル2分割 [9,2]（実台数）
+#   戻り: 対象道路の次サイクル [t3,t4]（実台数）
 # ============================================================
-def run_prediction_red3(wait_9x3, target_node_index, model, scaler_wait, edge_index):
-    return red3.run_prediction_red3(wait_9x3, target_node_index, model, scaler_wait, edge_index)
+def run_prediction_red2(wait_9x2, target_node_index, model, scaler_wait, edge_index):
+    return red2.run_prediction_red2(wait_9x2, target_node_index, model, scaler_wait, edge_index)
 
 
 # ============================================================
@@ -107,7 +195,7 @@ class TrafficLogger:
 # パス設定（出力先は CONTROL_MODE に応じて自動決定）
 # ============================================================
 sumocfg_path   = r"C:\Users\Tsukasa\Desktop\研究\予測\町モデルデータ\toyama_shouwa.sumocfg"
-train_csv_path = r"C:\Users\Tsukasa\Desktop\研究\予測\新環境待ち台数データ_12.22.csv"
+train_csv_path = r"C:\Users\Tsukasa\Desktop\研究\予測\★学習用データ\1. 赤時間2分割_学習データ_12.22\新環境待ち台数データ_12.22.csv"
 adj_path       = r"C:\Users\Tsukasa\Desktop\研究\予測\新環境_隣接行列.csv"
 BASE_OUT       = r"C:\Users\Tsukasa\Desktop\研究\制御\csv掃き出し"
 
@@ -146,9 +234,9 @@ edge_index        = torch.tensor(edge_index_mapped, dtype=torch.long)
 # ============================================================
 # 信号設定
 # ============================================================
-SIM_END_TIME = int(os.environ.get("R3_END", "86400"))   # 終了時刻(秒)。R3_END で上書き可（デバッグ短縮用）
+SIM_END_TIME = int(os.environ.get("R2_END", "86400"))   # 終了時刻(秒)。R2_END で上書き可（デバッグ短縮用）
 PREP_TIME    = 1200
-USE_GUI      = os.environ.get("R3_GUI", "0") == "1"      # R3_GUI=1 で sumo-gui、既定は headless sumo
+USE_GUI      = os.environ.get("R2_GUI", "0") == "1"      # R2_GUI=1 で sumo-gui、既定は headless sumo
 
 # ============================================================
 # 集計の時間窓（24hデータのうち、この時間帯だけに絞った集計も出力する）
@@ -175,9 +263,10 @@ def in_analysis_window(step):
 #   "gap"        : ギャップ感応制御（GapCycleController）
 #   "none"       : 制御なし（固定サイクル・計測・遅れ時間ログのみ）
 # ============================================================
-CONTROL_MODE = os.environ.get("R3_MODE", "prediction")   # prediction/gap/none（環境変数 R3_MODE で上書き可）
+CONTROL_MODE = os.environ.get("R2_MODE", "prediction")   # prediction/gap/none（環境変数 R2_MODE で上書き可）
 # ※ 旧フラグ。現在はどの制御にも影響しない（未使用）。
-#   ギャップ感応の累積オフセット補正は常時有効になった。
+#   ギャップ感応の累積オフセット補正は常時有効になり、予測制御側の
+#   奇数制御/偶数打ち消しは R2_EVENCANCEL（EVEN_CYCLE_CANCEL_PRED）で切り替える。
 ENABLE_EVEN_CYCLE_CANCEL = False
 
 # ── オフセット調整パラメータ（ここを変更して閾値・補正量を調整）──────────────
@@ -196,19 +285,44 @@ _MODE_FOLDER_MAP = {
     "npred":      "N単独制御",
     "none":       "制御なし",
 }
-# 出力フォルダ名。予測制御は案ごと、予測ギャップは GAP_SHORT ごとに分けて衝突を防ぐ。
+# 出力は「csv掃き出し/赤2分割/<制御方式>/」にまとめる。
+# 3分割版(4. 信号制御_赤3分割.py)は csv掃き出し 直下に出力するので、混ざらない。
+_RESULT_ROOT = os.path.join(BASE_OUT, "赤2分割")
 if CONTROL_MODE == "prediction":
-    _OUT_FOLDER = f"予測制御_案{CONTROL_VARIANT}"
+    if CONTROL_VARIANT != "red2":
+        _OUT_FOLDER = f"予測制御_{CONTROL_VARIANT}"
+    elif DELTA_RULE == "weighted":
+        # x1/x2 を変えて試すたびに別フォルダへ出す（前の結果を潰さない）
+        _OUT_FOLDER = f"予測制御_x1={DELTA_X1:g}_x2={DELTA_X2:g}"
+        if USE_PEAK_WEIGHTS:
+            _OUT_FOLDER += f"_ピーク{PEAK_HOURS_SPEC}_x1={DELTA_X1_PEAK:g}_x2={DELTA_X2_PEAK:g}"
+    else:
+        _OUT_FOLDER = "予測制御_旧ルール"
+    if EVEN_CYCLE_CANCEL_PRED:
+        _OUT_FOLDER += "_偶数打消"
+    if MODEL_DIR_ROAD1 != "道路1_分散評価あり" or MODEL_DIR_ROAD5 != "道路5_分散評価あり":
+        _OUT_FOLDER += "_別モデル"
 elif CONTROL_MODE == "pgap":
-    _OUT_FOLDER = "予測ギャップ制御" if PGAP_GAP_SHORT == 2 else f"予測ギャップ制御_gap{PGAP_GAP_SHORT}s"
+    _OUT_FOLDER = ("予測ギャップ制御" if PGAP_GAP_SHORT == 2
+                   else f"予測ギャップ制御_gap{PGAP_GAP_SHORT}s")
 else:
     _OUT_FOLDER = _MODE_FOLDER_MAP[CONTROL_MODE]
-OUT_DIR      = os.path.join(BASE_OUT, _OUT_FOLDER)
+OUT_DIR      = os.path.join(_RESULT_ROOT, _OUT_FOLDER)
 log_dir_path = os.path.join(OUT_DIR, "各道路計測ログ")
 _delay_dir   = os.path.join(OUT_DIR, "遅れ時間")
 os.makedirs(_delay_dir,   exist_ok=True)
 os.makedirs(log_dir_path, exist_ok=True)
-print(f"偶数サイクル打ち消し: {'あり' if ENABLE_EVEN_CYCLE_CANCEL else 'なし（毎サイクル制御）'}")
+print(f"🚦 赤2分割GNN制御  mode={CONTROL_MODE} / variant={CONTROL_VARIANT}")
+if CONTROL_MODE == "prediction":
+    if DELTA_RULE == "weighted":
+        print(f"   delta規則: 需要重み付け  delta = -10 + (前半×{DELTA_X1:g} + 後半×{DELTA_X2:g})×2"
+              f"  （重み付き 0台→BASE-10s / 5台→BASE / 10台→BASE+10s）")
+        if USE_PEAK_WEIGHTS:
+            print(f"   ピーク時間帯({PEAK_HOURS_SPEC}時)は 前半×{DELTA_X1_PEAK:g} + 後半×{DELTA_X2_PEAK:g}")
+    else:
+        print(f"   delta規則: 旧2分割（t3>t4→+t3*2 / t3<t4→-t4*2） デッドバンド={DELTA_DEADBAND}台")
+    print(f"   delta方式: {'奇数制御/偶数打ち消し（旧2分割方式）' if EVEN_CYCLE_CANCEL_PRED else '毎サイクル制御＋累積補正'}")
+    print(f"   使用モデル: 道路1={MODEL_DIR_ROAD1} / 道路5={MODEL_DIR_ROAD5}")
 print(f"📁 出力フォルダ: {OUT_DIR}")
 
 TRAFFIC_LIGHT_CONFIG = {
@@ -425,13 +539,13 @@ def write_hourly_summary():
 prediction_log_path = os.path.join(OUT_DIR, "予測結果_道路1.csv")
 prediction_log_file = open(prediction_log_path, "w", newline="", encoding="utf-8-sig")
 prediction_writer   = csv.writer(prediction_log_file)
-prediction_writer.writerow(["回数", "step", "予測t4", "予測t5", "予測t6", "予測合計"])
+prediction_writer.writerow(["回数", "step", "予測t3", "予測t4", "予測合計"])
 
 # === 道路5 予測結果ログ ===
 prediction_log_path_road5 = os.path.join(OUT_DIR, "予測結果_道路5.csv")
 prediction_log_file_road5 = open(prediction_log_path_road5, "w", newline="", encoding="utf-8-sig")
 prediction_writer_road5   = csv.writer(prediction_log_file_road5)
-prediction_writer_road5.writerow(["回数", "step", "予測t4", "予測t5", "予測t6", "予測合計"])
+prediction_writer_road5.writerow(["回数", "step", "予測t3", "予測t4", "予測合計"])
 
 # === フェーズ時間ログ ===
 phase_log_path = os.path.join(OUT_DIR, "信号A_フェーズ時間ログ.csv")
@@ -525,37 +639,40 @@ j_adjust_pending  = {0: False, 5: False}
 #     フェーズが既に使っている分を差し引いて枠内に収める。
 # ※ 予測制御・ギャップ感応制御の両方に同じ枠を適用する。
 J_GREEN_DEV_CLAMP = 10
-J_CYCLE_DEV_CLAMP = int(os.environ.get("R3_CYCLECAP", "10"))
-J_MIN_GREEN       = 5.0    # 青の絶対下限
-
-
-def clamp_delta_for_cycle(phase_idx, delta, other_delta=None):
-    """delta を「自フェーズ ±J_GREEN_DEV_CLAMP」かつ
-    「もう一方のフェーズとの合計が ±J_CYCLE_DEV_CLAMP 以内」に収める。"""
-    other = J_GREEN_PHASES[1] if phase_idx == J_GREEN_PHASES[0] else J_GREEN_PHASES[0]
-    od = j_applied_delta[other] if other_delta is None else other_delta
-    lo = max(-J_GREEN_DEV_CLAMP, -J_CYCLE_DEV_CLAMP - od)
-    hi = min( J_GREEN_DEV_CLAMP,  J_CYCLE_DEV_CLAMP - od)
-    if lo > hi:
-        return 0
-    return int(max(lo, min(delta, hi)))
-
-
-def green_bounds_for_phase(phase_idx, other_delta=None):
-    """そのフェーズが取ってよい青時間の [下限, 上限]（秒）。
-    スケジュール青 ± J_GREEN_DEV_CLAMP を、サイクル長の枠で更に絞る。"""
-    sched = j_scheduled_green[phase_idx]
-    lo_d = clamp_delta_for_cycle(phase_idx, -J_GREEN_DEV_CLAMP, other_delta)
-    hi_d = clamp_delta_for_cycle(phase_idx,  J_GREEN_DEV_CLAMP, other_delta)
-    return max(J_MIN_GREEN, sched + lo_d), max(J_MIN_GREEN, sched + hi_d)
+J_CYCLE_DEV_CLAMP = int(os.environ.get("R2_CYCLECAP", "10"))
+J_MIN_GREEN       = 5.0    # 青の絶対下限（これを下回る短縮はしない）
 
 
 def update_j_scheduled_green(target_cycle):
     """目標サイクル長に応じてJの青(phase0/phase5)のスケジュール値を更新。
     build_scaled_logic と同じ配分（青2本に (target-120)/2 ずつ）。"""
-    per = (target_cycle - red3.BASE_CYCLE_LENGTH) / 2.0
+    per = (target_cycle - red2.BASE_CYCLE_LENGTH) / 2.0
     for p in J_GREEN_PHASES:
         j_scheduled_green[p] = J_BASE_GREEN[p] + per
+
+
+def clamp_delta_for_cycle(phase_idx, delta, other_delta=None):
+    """delta を「自フェーズ ±J_GREEN_DEV_CLAMP」かつ
+    「もう一方のフェーズとの合計が ±J_CYCLE_DEV_CLAMP 以内」に収める。
+    サイクル長が 100s でも 130s でも、この幅は絶対秒数で変わらない。"""
+    other = J_GREEN_PHASES[1] if phase_idx == J_GREEN_PHASES[0] else J_GREEN_PHASES[0]
+    od = j_applied_delta[other] if other_delta is None else other_delta
+    lo = max(-J_GREEN_DEV_CLAMP, -J_CYCLE_DEV_CLAMP - od)
+    hi = min( J_GREEN_DEV_CLAMP,  J_CYCLE_DEV_CLAMP - od)
+    if lo > hi:          # 相手が枠を使い切っている場合は動かさない
+        return 0
+    return int(max(lo, min(delta, hi)))
+
+
+def green_bounds_for_phase(phase_idx, other_delta=None):
+    """そのフェーズが取ってよい青時間の [下限, 上限]（秒）を返す。
+    スケジュール青 ± J_GREEN_DEV_CLAMP を基本に、サイクル長の枠
+    （もう一方のフェーズのずれとの合計 ±J_CYCLE_DEV_CLAMP）で更に絞る。
+    ギャップ感応制御はこの範囲内で青を切る。"""
+    sched = j_scheduled_green[phase_idx]
+    lo_d = clamp_delta_for_cycle(phase_idx, -J_GREEN_DEV_CLAMP, other_delta)
+    hi_d = clamp_delta_for_cycle(phase_idx,  J_GREEN_DEV_CLAMP, other_delta)
+    return max(J_MIN_GREEN, sched + lo_d), max(J_MIN_GREEN, sched + hi_d)
 
 
 def apply_j_logic():
@@ -576,42 +693,73 @@ def apply_j_logic():
     traci.trafficlight.setProgramLogic("J", logic)
 
 
-def control_j_road(phase_idx, road_id, t456, step, count):
-    """予測 [t4,t5,t6] から delta を求め、累積補正込みで phase_idx の青を更新。戻り: 適用delta。
-    CONTROL_MODE!='prediction' または CONTROL_VARIANT=='none' のときは制御しない（delta=0）。"""
+# 奇数/偶数サイクル方式（R2_EVENCANCEL=1）用の状態: 青フェーズごとのサイクル数と前回delta
+j_cycle_count   = {0: 0, 5: 0}
+j_last_delta    = {0: 0, 5: 0}
+
+
+def control_j_road(phase_idx, road_id, t34, step, count):
+    """予測 [t3,t4]（次サイクルの赤 前半/後半）から delta を求め、phase_idx の青を更新。
+    戻り: 適用delta。CONTROL_MODE!='prediction' または CONTROL_VARIANT=='none' なら制御しない。
+
+    2つの方式を切り替えられる:
+      ・既定（EVEN_CYCLE_CANCEL_PRED=False）… 毎サイクル制御し、累積が
+        OFFSET_ADJUST_THRESHOLD に達したら調整サイクルで押し戻す（3分割版と同じ）。
+      ・R2_EVENCANCEL=1 … 旧2分割制御と同じく、奇数サイクルで予測制御・偶数サイクルで
+        前サイクルの delta を打ち消す（累積は常に0付近に戻る）。
+    """
     if CONTROL_MODE != "prediction" or CONTROL_VARIANT == "none":
         j_applied_delta[phase_idx] = 0
         apply_j_logic()
         return 0
 
-    if j_adjust_pending[phase_idx]:
+    if EVEN_CYCLE_CANCEL_PRED:
+        # ===== 旧2分割方式: 奇数=制御 / 偶数=打ち消し =====
+        j_cycle_count[phase_idx] += 1
+        if j_cycle_count[phase_idx] % 2 == 1:
+            _x1, _x2 = weights_at(step)
+            delta = (red2.delta_red2_weighted(t34, _x1, _x2)
+                     if DELTA_RULE == "weighted"
+                     else red2.delta_red2(t34, deadband=DELTA_DEADBAND))
+            j_last_delta[phase_idx] = delta
+            _tag = f"奇数#{j_cycle_count[phase_idx]}"
+        else:
+            delta = -j_last_delta[phase_idx]
+            _tag = f"偶数#{j_cycle_count[phase_idx]}(打ち消し)"
+        j_cumulative[phase_idx] += delta
+    elif j_adjust_pending[phase_idx]:
         # 調整サイクル：累積を OFFSET_ADJUST_PER_CYCLE で押し戻す
         delta = -OFFSET_ADJUST_PER_CYCLE if j_cumulative[phase_idx] > 0 else OFFSET_ADJUST_PER_CYCLE
         j_adjust_pending[phase_idx] = False
         j_cumulative[phase_idx] += delta
         if abs(j_cumulative[phase_idx]) >= OFFSET_ADJUST_PER_CYCLE:
             j_adjust_pending[phase_idx] = True
+        _tag = "調整"
     else:
-        delta = red3.delta_variant(t456, road_id, CONTROL_VARIANT)
+        _x1, _x2 = weights_at(step)
+        delta = (red2.delta_red2_weighted(t34, _x1, _x2)
+                 if DELTA_RULE == "weighted"
+                 else red2.delta_red2(t34, deadband=DELTA_DEADBAND))
         j_cumulative[phase_idx] += delta
         if abs(j_cumulative[phase_idx]) >= OFFSET_ADJUST_THRESHOLD:
             j_adjust_pending[phase_idx] = True
+        _tag = "通常"
 
     # === 可動範囲の適用 ===
     # 自フェーズ ±J_GREEN_DEV_CLAMP に加え、もう一方のフェーズとの合計が
     # ±J_CYCLE_DEV_CLAMP を超えないよう切り詰める（サイクル長のずれの上限）。
     _raw = delta
     delta = clamp_delta_for_cycle(phase_idx, delta)
-    _lim = ""
     if delta != _raw:
-        j_cumulative[phase_idx] += delta - _raw   # 実際に適用した量だけ累積する
-        _lim = f"[枠制限 {_raw:+d}→{delta:+d}]"
+        # 切り詰めた分は累積に乗せない（実際に適用した量だけを累積する）
+        j_cumulative[phase_idx] += delta - _raw
+        _tag += f"[枠制限 {_raw:+d}→{delta:+d}]"
 
     j_applied_delta[phase_idx] = delta
     apply_j_logic()
     _cycle_dev = j_applied_delta[J_GREEN_PHASES[0]] + j_applied_delta[J_GREEN_PHASES[1]]
-    print(f"✅ [道路{road_id}制御#{count}] variant={CONTROL_VARIANT}{_lim} "
-          f"pred={np.round(np.asarray(t456), 1)} delta={delta} "
+    print(f"✅ [道路{road_id}制御#{count}] {_tag} "
+          f"pred[t3,t4]={np.round(np.asarray(t34), 1)} delta={delta} "
           f"累積={j_cumulative[phase_idx]}s サイクルずれ={_cycle_dev:+d}s (step={step})")
     return delta
 
@@ -1134,8 +1282,12 @@ class GapCycleController:
         self.MINOR_GREEN = 5   # 従道路(道路5)青フェーズ番号（現ネット: phase5=道路5緑。旧net phase6は誤り）
 
         # ── 青時間の基準と可動範囲 ──────────────────
-        # 「その時間帯のスケジュール青 ± J_GREEN_DEV_CLAMP」を毎青ごとに取り直す。
-        # （以前は 60/50/70s・26/16/36s の固定値で、時間帯別サイクル長に追従していなかった）
+        # ★以前は BASE/MIN/MAX を 60/50/70（主）・26/16/36（従）で固定していたため、
+        #   時間帯別サイクル長（100/110/130s）が変わっても J だけ青が追従せず、
+        #   他の信号（A〜P）とサイクル長が食い違っていた。
+        #   現在は「その時間帯のスケジュール青 ± J_GREEN_DEV_CLAMP」を基準にし、
+        #   さらにサイクル長のずれが ±J_CYCLE_DEV_CLAMP に収まるよう毎青ごとに
+        #   _refresh_bounds() で取り直す（予測制御と同じ枠）。
         # ※ 派生クラス（pgapmin/npred）が MIN/MAX を独自に設定する場合は
         #   self.follow_schedule = False にすればこの追従を止められる。
         self.follow_schedule = True
@@ -1150,8 +1302,10 @@ class GapCycleController:
         # 現在の青に割り当てている長さ（MIN から始めて、車が来るたび延長する）
         self.main_allotted  = 0.0
         self.minor_allotted = 0.0
-        # その青を開始した時点の BASE。偏差はこれを基準に測る
-        # （サイクル長切替が青の途中で起きると BASE が変わり、基準が食い違うため）
+        # その青を開始した時点の BASE（= スケジュール青）。偏差はこれを基準に測る。
+        # ※ 時間帯別サイクル長の切替が青の途中で起きると BASE が変わるため、
+        #   開始時の値を控えておかないと「割り当てたときの基準」と「測るときの基準」が
+        #   食い違い、偏差が枠(±10s)を超える（実測で +25s の例あり）。
         self.main_base_at_start  = 0.0
         self.minor_base_at_start = 0.0
 
@@ -1177,13 +1331,16 @@ class GapCycleController:
         self.minor_adj_pending        = False
         self.minor_adj_active         = False
         # SUMO側の青時間は上限(MAX)に設定しておき、実際の長さは
-        # 「MINから開始 → 車が来るたび延長 → 隙間で終了」で決める。
+        # 「MIN以上でギャップ発生 / MAXで強制打ち切り」で決める（通常サイクル終了時も同じ）。
+        # ※ 以前は既定パスで BASE を一度設定するだけだったため、時間帯別サイクル長が
+        #   変わっても SUMO 側の duration が初期値のまま残り、青が上限まで伸びなかった。
         self._set_phase_duration(self.MAIN_GREEN, self.MAX_MAIN_GREEN)
         self._set_phase_duration(self.MINOR_GREEN, self.MAX_MINOR_GREEN)
 
     def _refresh_bounds(self):
         """その時間帯のスケジュール青を基準に、青の下限/上限を取り直す。
-        主道路と従道路それぞれ「スケジュール青 ±10s」かつ「両者の合計ずれが ±10s以内」。"""
+        主道路と従道路それぞれ「スケジュール青 ±10s」かつ「両者の合計ずれが ±10s以内」。
+        目標サイクル長が変わったとき・各青の開始時に呼ぶ。"""
         if not getattr(self, "follow_schedule", True):
             return
         _last = getattr(self, "last_dev", {self.MAIN_GREEN: 0, self.MINOR_GREEN: 0})
@@ -1203,6 +1360,18 @@ class GapCycleController:
             self._set_phase_duration(self.MAIN_GREEN, self.MAX_MAIN_GREEN)
         if not (self.minor_adj_pending or self.minor_adj_active):
             self._set_phase_duration(self.MINOR_GREEN, self.MAX_MINOR_GREEN)
+
+    def _set_phase_duration(self, phase_index, duration):
+        from traci._trafficlight import Phase
+        logic  = traci.trafficlight.getAllProgramLogics(self.tls_id)[0]
+        phases = list(logic.getPhases())
+        p = phases[phase_index]
+        phases[phase_index] = Phase(duration=duration, state=p.state,
+                                    minDur=duration, maxDur=duration)
+        new_logic = traci.trafficlight.Logic(
+            programID=logic.programID, type=logic.type,
+            currentPhaseIndex=logic.currentPhaseIndex, phases=phases)
+        traci.trafficlight.setProgramLogic(self.tls_id, new_logic)
 
     def _vehicle_detected(self, detectors):
         """このステップに感知器上へ車が居たか（延長判定用）。"""
@@ -1226,7 +1395,8 @@ class GapCycleController:
         return allotted
 
     def _extend_green(self, green_time, allotted, max_green):
-        """車が来たので「今から MAX_GAP 秒先」まで延長する（上限 max_green）。"""
+        """車が来たので「今から MAX_GAP 秒先」まで延長する（上限 max_green）。
+        延長後の割当を返す。延長不要ならそのまま返す。"""
         new_end = min(green_time + self.MAX_GAP, max_green)
         if new_end > allotted:
             try:
@@ -1236,18 +1406,6 @@ class GapCycleController:
                 print(f"⚠️ setPhaseDuration(延長) 失敗: {e}")
             return new_end
         return allotted
-
-    def _set_phase_duration(self, phase_index, duration):
-        from traci._trafficlight import Phase
-        logic  = traci.trafficlight.getAllProgramLogics(self.tls_id)[0]
-        phases = list(logic.getPhases())
-        p = phases[phase_index]
-        phases[phase_index] = Phase(duration=duration, state=p.state,
-                                    minDur=duration, maxDur=duration)
-        new_logic = traci.trafficlight.Logic(
-            programID=logic.programID, type=logic.type,
-            currentPhaseIndex=logic.currentPhaseIndex, phases=phases)
-        traci.trafficlight.setProgramLogic(self.tls_id, new_logic)
 
     def _gap_occurred_major(self, step):
         for det in self.MAJOR_DETECTORS:
@@ -1277,7 +1435,7 @@ class GapCycleController:
             self.main_green_active       = True
             self.main_green_start_time   = step
             self.last_major_vehicle_time = step
-            self._refresh_bounds()          # その時間帯のスケジュール青 ±10s に更新
+            self._refresh_bounds()   # その時間帯のスケジュール青 ±10s（かつサイクル ±10s）に更新
             self.main_base_at_start = self.BASE_MAIN_GREEN   # 偏差の基準をこの青の開始時点で固定
             if self.main_adj_pending:
                 self.main_adj_active  = True
@@ -1299,11 +1457,15 @@ class GapCycleController:
             green_time             = step - self.main_green_start_time
             self.main_green_active = False
             deviation = green_time - self.main_base_at_start
-            self.last_dev[self.MAIN_GREEN] = deviation   # 相手フェーズの枠計算に使う
+            self.last_dev[self.MAIN_GREEN] = deviation   # 従道路側の枠計算に使う
 
-            # ★累積オフセット補正は常時有効（予測制御と同じ方式に揃えた）
+            # ★累積オフセット補正は常時有効（予測制御と同じ方式に揃えた）。
+            #   以前は ENABLE_EVEN_CYCLE_CANCEL=False のとき偏差を表示するだけで
+            #   累積も調整サイクルも動かず、サイクル長のずれが押し戻されなかった。
             if step < PREP_TIME:
-                # 準備時間中は累積しない（開始直後の部分的な青で累積が汚れるため）
+                # 準備時間中は累積しない。開始直後の1本目の青は traci 接続時に
+                # 既に進行中だった位相の残りなので偏差が過大に出て累積を汚すため。
+                # （予測制御も準備時間後にしか動かないので、これで条件が揃う）
                 self._set_phase_duration(self.MAIN_GREEN, self.MAX_MAIN_GREEN)
             elif self.main_adj_active:
                 # 調整サイクル終了
@@ -1337,7 +1499,7 @@ class GapCycleController:
             self.minor_green_active       = True
             self.minor_green_start_time   = step
             self.last_minor_vehicle_time  = step
-            self._refresh_bounds()          # その時間帯のスケジュール青 ±10s に更新
+            self._refresh_bounds()   # その時間帯のスケジュール青 ±10s（かつサイクル ±10s）に更新
             self.minor_base_at_start = self.BASE_MINOR_GREEN   # 偏差の基準をこの青の開始時点で固定
             if self.minor_adj_pending:
                 self.minor_adj_active  = True
@@ -1359,11 +1521,13 @@ class GapCycleController:
             green_time              = step - self.minor_green_start_time
             self.minor_green_active = False
             deviation = green_time - self.minor_base_at_start
-            self.last_dev[self.MINOR_GREEN] = deviation   # 相手フェーズの枠計算に使う
+            self.last_dev[self.MINOR_GREEN] = deviation   # 主道路側の枠計算に使う
 
-            # ★累積オフセット補正は常時有効（予測制御と同じ方式に揃えた）
+            # ★累積オフセット補正は常時有効（主道路と同じ）
             if step < PREP_TIME:
-                # 準備時間中は累積しない（開始直後の部分的な青で累積が汚れるため）
+                # 準備時間中は累積しない。開始直後の1本目の青は traci 接続時に
+                # 既に進行中だった位相の残りなので偏差が過大に出て累積を汚すため。
+                # （予測制御も準備時間後にしか動かないので、これで条件が揃う）
                 self._set_phase_duration(self.MINOR_GREEN, self.MAX_MINOR_GREEN)
             elif self.minor_adj_active:
                 # 調整サイクル終了
@@ -1393,9 +1557,10 @@ class GapCycleController:
                     self._set_phase_duration(self.MINOR_GREEN, self.MAX_MINOR_GREEN)
 
         # ── 主道路「青」中: MIN から始めて、車が来るたびに延長 ─────────
-        #   ・割当の初期値 = MIN（= BASE−10s）／上限 = MAX（= BASE+10s）＝最大20s延長
-        #   ・感知器に車が来たら「今から MAX_GAP(5s) 先」まで割当を伸ばす
+        #   ・割当の初期値 = MIN（= BASE−10s）
+        #   ・感知器に車が来たら「今から MAX_GAP(5s) 先」まで割当を伸ばす（上限 MAX = BASE+10s）
         #     → 5秒の隙間が空いた時点で割当が尽きて青が終わる（＝ギャップ感応）
+        #   ・延長幅は最大 20s（MIN → MAX）で、予測制御の delta ±10s と同じ範囲に収まる
         #   ・MAX 到達時は保険として強制的に切る（調整サイクル中も枠を超えさせない）
         if phase == self.MAIN_GREEN and self.main_green_active:
             green_time = step - self.main_green_start_time
@@ -1459,12 +1624,12 @@ class PredictiveGapController(GapCycleController):
         self._eff_counted   = {"main": False, "minor": False}  # 1青あたり1回のみ計上
 
     def _predict_N(self, road_id, node_index):
-        """全9道路の待ち台数(3分割合計) + 対象道路の現在Nから、次サイクルNを予測。
+        """全9道路の待ち台数(分割合計=1サイクル総数) + 対象道路の現在Nから、次サイクルNを予測。
         トラッカーが未整備(None)なら None を返す（→従来ギャップに縮退）。"""
-        w9x3 = self.tracker.model_input()
-        if w9x3 is None:
+        w9x2 = self.tracker.model_input()
+        if w9x2 is None:
             return None
-        wait_9 = w9x3.sum(axis=1)                       # 各道路の待ち台数合計 [9]
+        wait_9 = w9x2.sum(axis=1)                       # 各道路の待ち台数合計 [9]
         n_cur = self.tracker.latest_N.get(road_id, 0)   # 現サイクルの実測N
         model, sw, si, node = self.dual[road_id]
         _W, N_pred = arr.predict_WN(wait_9, n_cur, model, sw, si, self.edge_index, node)
@@ -1673,10 +1838,10 @@ class MinGreenPredGapController(GapCycleController):
         self.min_cnt = {"main": 0, "minor": 0}
 
     def _predict_W(self, road_id, node_index):
-        w9x3 = self.tracker.model_input()
-        if w9x3 is None:
+        w9x2 = self.tracker.model_input()
+        if w9x2 is None:
             return None
-        wait_9 = w9x3.sum(axis=1)
+        wait_9 = w9x2.sum(axis=1)
         n_cur = self.tracker.latest_N.get(road_id, 0)
         model, sw, si, node = self.dual[road_id]
         W_pred, _N = arr.predict_WN(wait_9, n_cur, model, sw, si, self.edge_index, node)
@@ -1761,14 +1926,14 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
     if not os.path.exists(log_dir_path):
         os.makedirs(log_dir_path)
 
-    # === 赤3分割モデル＋スケーラー読み込み（分散評価あり） ===
-    model_road1, scaler_road1 = red3.load_road_model("道路1_分散評価あり")
-    print("✅ 道路1 赤3分割モデル＋スケーラー読み込み完了")
-    model_road5, scaler_road5 = red3.load_road_model("道路5_分散評価あり")
-    print("✅ 道路5 赤3分割モデル＋スケーラー読み込み完了")
+    # === 赤2分割モデル＋スケーラー読み込み（既定: 分散評価あり / R2_MODEL1・R2_MODEL5 で変更可） ===
+    model_road1, scaler_road1 = red2.load_road_model(MODEL_DIR_ROAD1)
+    print(f"✅ 道路1 赤2分割モデル＋スケーラー読み込み完了（{MODEL_DIR_ROAD1}）")
+    model_road5, scaler_road5 = red2.load_road_model(MODEL_DIR_ROAD5)
+    print(f"✅ 道路5 赤2分割モデル＋スケーラー読み込み完了（{MODEL_DIR_ROAD5}）")
 
-    # === 赤3分割の実時間計測トラッカー（全9道路・初停車ビン方式） ===
-    red3_tracker = red3.RedSplit3Tracker()
+    # === 赤2分割の実時間計測トラッカー（全9道路・初停車ビン方式） ===
+    red2_tracker = red2.RedSplit2Tracker()
 
     sumoBinary = sumolib.checkBinary('sumo-gui' if USE_GUI else 'sumo')
     traci.start([sumoBinary, "-c", sumocfg_path, "--start", "--quit-on-end"])
@@ -1848,13 +2013,13 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
         gap_controller = GapCycleController("J")
         print("🔀 ギャップ感応制御モード で起動")
     elif CONTROL_MODE == "pgap":
-        gap_controller = PredictiveGapController("J", red3_tracker, edge_index)
+        gap_controller = PredictiveGapController("J", red2_tracker, edge_index)
         print("🔮 予測ギャップ感応制御モード で起動（ギャップ骨格+到着間隔N）")
     elif CONTROL_MODE == "pgapmin":
-        gap_controller = MinGreenPredGapController("J", red3_tracker, edge_index)
+        gap_controller = MinGreenPredGapController("J", red2_tracker, edge_index)
         print("🔮 予測ギャップ【MIN調整版】で起動（W予測でMIN_GREEN可変・ギャップ5s維持）")
     elif CONTROL_MODE == "npred":
-        gap_controller = PredNOnlyController("J", red3_tracker, edge_index)
+        gap_controller = PredNOnlyController("J", red2_tracker, edge_index)
         print("🎯 N単独制御モード で起動（ギャップ無視・通過台数≥予測Nで青を切る）")
     else:
         gap_controller = None
@@ -1867,7 +2032,7 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
     # 全120s信号に対し、各目標サイクル長のスケール済みプログラムを事前生成しておく。
     # J交差点はGNN制御でphase0/phase5を可変にするため、ここでは J 以外を対象にする。
     cycle_scaled_logics = {}   # tl_id -> {cycle_length: Logic}
-    _target_cycles = {red3.PREP_CYCLE_LENGTH} | {c for _, _, c in red3.CYCLE_SCHEDULE_BY_HOUR}
+    _target_cycles = {red2.PREP_CYCLE_LENGTH} | {c for _, _, c in red2.CYCLE_SCHEDULE_BY_HOUR}
     for tl_id in traci.trafficlight.getIDList():
         if tl_id == "J":
             continue   # J は GNN制御側で apply_j_logic により別途スケジュール
@@ -1876,11 +2041,11 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
         except Exception:
             continue
         base_cycle = sum(ph.duration for ph in base_logic.phases)
-        if abs(base_cycle - red3.BASE_CYCLE_LENGTH) > 0.5:
+        if abs(base_cycle - red2.BASE_CYCLE_LENGTH) > 0.5:
             continue   # 120s以外は対象外
         scaled = {}
         for cyc in _target_cycles:
-            lg = red3.build_scaled_logic(traci, base_logic, cyc)
+            lg = red2.build_scaled_logic(traci, base_logic, cyc)
             if lg is not None:
                 scaled[cyc] = lg
         if scaled:
@@ -1898,33 +2063,33 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
             print(f"🛑 SIM_END_TIME {SIM_END_TIME}s 到達 → 終了")
             break
 
-        # === 赤3分割の実時間計測（全9道路・初停車ビン）: 毎ステップ更新 ===
-        #   finalized: このステップで赤終了し3分割が確定した道路のリスト。
+        # === 赤2分割の実時間計測（全9道路・初停車ビン）: 毎ステップ更新 ===
+        #   finalized: このステップで赤終了し2分割が確定した道路のリスト。
         #   ※ 旧「赤終了ブロック」は j_road_red_start 依存（green文字列がプレースホルダで
         #     機能しない）ため、予測・制御はトラッカーの確定シグナルから直接発火させる。
-        finalized_roads = red3_tracker.step(traci, sim_time, PREP_TIME)
+        finalized_roads = red2_tracker.step(traci, sim_time, PREP_TIME)
 
         if sim_time >= PREP_TIME and CONTROL_MODE == "prediction" and finalized_roads:
-            _wait_9x3 = red3_tracker.model_input()
-            if _wait_9x3 is not None:
+            _wait_9x2 = red2_tracker.model_input()
+            if _wait_9x2 is not None:
                 # --- 道路1（node0 / phase0）---
                 if "1" in finalized_roads:
-                    _pred1 = run_prediction_red3(_wait_9x3, 0, model_road1, scaler_road1, edge_index)
+                    _pred1 = run_prediction_red2(_wait_9x2, 0, model_road1, scaler_road1, edge_index)
                     prediction_count += 1
                     prediction_writer.writerow([prediction_count, int(sim_time),
                                                 round(float(_pred1[0]), 2), round(float(_pred1[1]), 2),
-                                                round(float(_pred1[2]), 2), round(float(np.sum(_pred1)), 2)])
-                    print(f"🔮 [道路1][{prediction_count}] 予測[t4,t5,t6]={np.round(_pred1, 2)} (step={int(sim_time)})")
+                                                round(float(np.sum(_pred1)), 2)])
+                    print(f"🔮 [道路1][{prediction_count}] 予測[t3,t4]={np.round(_pred1, 2)} (step={int(sim_time)})")
                     if control_signal:
                         control_j_road(0, "1", _pred1, int(sim_time), prediction_count)
                 # --- 道路5（node4 / phase5）---
                 if "5" in finalized_roads:
-                    _pred5 = run_prediction_red3(_wait_9x3, 4, model_road5, scaler_road5, edge_index)
+                    _pred5 = run_prediction_red2(_wait_9x2, 4, model_road5, scaler_road5, edge_index)
                     prediction_count_road5 += 1
                     prediction_writer_road5.writerow([prediction_count_road5, int(sim_time),
                                                       round(float(_pred5[0]), 2), round(float(_pred5[1]), 2),
-                                                      round(float(_pred5[2]), 2), round(float(np.sum(_pred5)), 2)])
-                    print(f"🔮 [道路5][{prediction_count_road5}] 予測[t4,t5,t6]={np.round(_pred5, 2)} (step={int(sim_time)})")
+                                                      round(float(np.sum(_pred5)), 2)])
+                    print(f"🔮 [道路5][{prediction_count_road5}] 予測[t3,t4]={np.round(_pred5, 2)} (step={int(sim_time)})")
                     if control_signal:
                         control_j_road(5, "5", _pred5, int(sim_time), prediction_count_road5)
 
@@ -1957,7 +2122,7 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
             signal_stopped_prev = _cur_stopped
 
         # === 時間帯別サイクル長の切替（目標が変わった時だけ全対象信号を差し替え）===
-        _target_cycle = red3.get_target_cycle(sim_time, PREP_TIME)
+        _target_cycle = red2.get_target_cycle(sim_time, PREP_TIME)
         if _target_cycle != current_applied_cycle:
             for tl_id, scaled in cycle_scaled_logics.items():
                 lg = scaled.get(_target_cycle)
@@ -1970,8 +2135,11 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
                     print(f"⚠️ サイクル長切替失敗 {tl_id}: {e}")
             # J交差点: スケジュール青は全モードで更新する（時間帯別サイクル長に追従させるため）。
             #   ・予測 / 制御なし … apply_j_logic() で位相長に反映する。
-            #   ・gap / pgap 系   … 位相長はギャップ制御が設定するので apply_j_logic は呼ばず、
-            #                       可動範囲（スケジュール青±10s）と上限を取り直す。
+            #   ・gap / pgap 系   … 位相長はギャップ制御が占有して設定するので apply_j_logic は
+            #                       呼ばず、代わりに可動範囲（スケジュール青±10s）を取り直す。
+            #     ※ 以前は gap 系でスケジュール青の更新自体を飛ばしていたため、
+            #        他の信号(A〜P)が100/110/130sに切り替わっても J だけ 120s 基準の
+            #        固定青(60/26s)のままで、サイクル長が食い違っていた。
             update_j_scheduled_green(_target_cycle)
             if CONTROL_MODE not in ("gap", "pgap", "pgapmin", "npred"):
                 apply_j_logic()
@@ -2074,12 +2242,12 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
                     if rid == "1":
                         delay_writer.writerow([prediction_count, int(sim_time), cnt_t1, diff, 0, actual_red, int(round(delay_sec))])
 
-                        # === 赤3分割: 全9道路の最新3分割 → 道路1(node0)の [t4,t5,t6] を予測 ===
-                        wait_9x3 = red3_tracker.model_input()
-                        if wait_9x3 is not None:
-                            pred = run_prediction_red3(wait_9x3, 0, model_road1, scaler_road1, edge_index)
+                        # === 赤2分割: 全9道路の最新2分割 → 道路1(node0)の [t3,t4] を予測 ===
+                        wait_9x2 = red2_tracker.model_input()
+                        if wait_9x2 is not None:
+                            pred = run_prediction_red2(wait_9x2, 0, model_road1, scaler_road1, edge_index)
                             prediction_count += 1
-                            print(f"🔮 [道路1][{prediction_count}] 予測[t4,t5,t6]={np.round(pred, 2)} (step={int(sim_time)})")
+                            print(f"🔮 [道路1][{prediction_count}] 予測[t3,t4]={np.round(pred, 2)} (step={int(sim_time)})")
                             if sim_time >= SIM_END_TIME:
                                 print(f"🛑 終了時刻 {SIM_END_TIME}s に到達。シミュレーション終了。")
                                 traci.close()
@@ -2087,7 +2255,7 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
                                 return
                             prediction_writer.writerow([prediction_count, int(sim_time),
                                                         round(float(pred[0]), 2), round(float(pred[1]), 2),
-                                                        round(float(pred[2]), 2), round(float(np.sum(pred)), 2)])
+                                                        round(float(np.sum(pred)), 2)])
                             if control_signal and CONTROL_MODE == "prediction":
                                 control_j_road(0, "1", pred, int(sim_time), prediction_count)
                         else:
@@ -2121,15 +2289,15 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
                     if rid == "5":
                         delay_writer_road5.writerow([prediction_count_road5, int(sim_time), cnt_t1, diff, 0, actual_red, int(round(delay_sec))])
 
-                        # === 赤3分割: 全9道路の最新3分割 → 道路5(node4)の [t4,t5,t6] を予測 ===
-                        wait_9x3 = red3_tracker.model_input()
-                        if wait_9x3 is not None:
-                            pred5 = run_prediction_red3(wait_9x3, 4, model_road5, scaler_road5, edge_index)
+                        # === 赤2分割: 全9道路の最新2分割 → 道路5(node4)の [t3,t4] を予測 ===
+                        wait_9x2 = red2_tracker.model_input()
+                        if wait_9x2 is not None:
+                            pred5 = run_prediction_red2(wait_9x2, 4, model_road5, scaler_road5, edge_index)
                             prediction_count_road5 += 1
-                            print(f"🔮 [道路5][{prediction_count_road5}] 予測[t4,t5,t6]={np.round(pred5, 2)} (step={int(sim_time)})")
+                            print(f"🔮 [道路5][{prediction_count_road5}] 予測[t3,t4]={np.round(pred5, 2)} (step={int(sim_time)})")
                             prediction_writer_road5.writerow([prediction_count_road5, int(sim_time),
                                                               round(float(pred5[0]), 2), round(float(pred5[1]), 2),
-                                                              round(float(pred5[2]), 2), round(float(np.sum(pred5)), 2)])
+                                                              round(float(np.sum(pred5)), 2)])
                             if control_signal and CONTROL_MODE == "prediction":
                                 # 道路5の青 = phase5（現ネット。旧phase6は旧ネットの名残）
                                 control_j_road(5, "5", pred5, int(sim_time), prediction_count_road5)
@@ -2367,7 +2535,7 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
                                         # ==========================================
                                         # 道路1 予測・制御（無効化）
                                         #   ※ 道路1は上の「動的赤終了検知」ブロックで
-                                        #     赤3分割トラッカーを使って予測・制御する。
+                                        #     赤2分割トラッカーを使って予測・制御する。
                                         #     ここ(pending_counts経路)には道路1は来ないため無効化。
                                         # ==========================================
                                         if False and road_id == "1":

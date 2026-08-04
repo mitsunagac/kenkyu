@@ -67,7 +67,8 @@ target_road_id = extract_road_id(selected_target_road)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # === データパス（★学習用データ フォルダ） ===
-DATA_DIR = os.path.join(BASE_DIR, "★学習用データ")
+# 間隔台数目が「道路1の1列（ヘッダ = 最大間隔発生台数目）」になっているのは 2. のフォルダ。
+DATA_DIR = os.path.join(BASE_DIR, "★学習用データ", "2. 到着間隔_学習データ_20260628 (道路1)")
 wait_csv_path     = os.path.join(DATA_DIR, "待ち台数_学習データ.csv")            # 全道路の待ち台数 (9列)
 interval_csv_path = os.path.join(DATA_DIR, "最大間隔発生台数目_学習データ.csv")  # 道路1の間隔台数目 (1列)
 adjacency_path    = os.path.join(BASE_DIR, "新環境_隣接行列.csv")

@@ -27,9 +27,12 @@ CYCLE_LEN = 3      # 赤3分割
 HORIZON   = 3      # 出力 t4,t5,t6
 ALPHA     = 2      # 対象道路ノードの強調（学習時と一致）
 
+# 研究/制御/新環境用/ から 研究/ まで3つ上がり、研究/予測/予測モデル/… を指す。
+# （フォルダを 計測/予測/制御 の3構成に整理した際に予測モデルが 研究/予測/ 配下へ移動したため、
+#   旧パス 研究/予測モデル/ のままだと FileNotFoundError になっていた。2026-08-02 修正）
 _PRED_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "予測モデル", "3. 赤時間3分割",
+    "予測", "予測モデル", "3. 赤時間3分割",
 )
 
 
