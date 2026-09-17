@@ -307,11 +307,38 @@ elif CONTROL_MODE == "pgap":
                    else f"予測ギャップ制御_gap{PGAP_GAP_SHORT}s")
 else:
     _OUT_FOLDER = _MODE_FOLDER_MAP[CONTROL_MODE]
+# R2_SUFFIX で出力フォルダ名に接尾辞を付けられる。
+# 時間距離図の採取のように途中で打ち切る実行では、既存の24h結果を潰さないよう必ず指定する。
+_OUT_FOLDER += os.environ.get("R2_SUFFIX", "")
 OUT_DIR      = os.path.join(_RESULT_ROOT, _OUT_FOLDER)
 log_dir_path = os.path.join(OUT_DIR, "各道路計測ログ")
 _delay_dir   = os.path.join(OUT_DIR, "遅れ時間")
 os.makedirs(_delay_dir,   exist_ok=True)
 os.makedirs(log_dir_path, exist_ok=True)
+
+
+class _Tee:
+    """標準出力を画面と 実行ログ.txt の両方へ流す。
+
+    ログには「どのサイクルが通常/調整で delta が何秒だったか」が残る。
+    時間距離図の右軸ラベル（★赤2分割_時間距離図_サイクル抽出.py）がこれを読むので、
+    毎回自動で保存しておく。
+    """
+
+    def __init__(self, stream, path):
+        self.stream = stream
+        self.file = open(path, "w", encoding="utf-8", errors="replace")
+
+    def write(self, s):
+        self.stream.write(s)
+        self.file.write(s)
+
+    def flush(self):
+        self.stream.flush()
+        self.file.flush()
+
+
+sys.stdout = _Tee(sys.stdout, os.path.join(OUT_DIR, "実行ログ.txt"))
 print(f"🚦 赤2分割GNN制御  mode={CONTROL_MODE} / variant={CONTROL_VARIANT}")
 if CONTROL_MODE == "prediction":
     if DELTA_RULE == "weighted":
@@ -796,9 +823,41 @@ matplotlib.use("Agg")   # 非対話バックエンド: plt.show() でブロッ�
 import matplotlib.pyplot as plt
 
 # パラメータ
-MEASURE_START = 30050  # 計測開始秒
-MEASURE_END   = 31000  # 計測終了秒
+# 計測窓は複数指定できる（"開始-終了,開始-終了" を R2_TSWIN で上書き）。
+# 既定は 6時台（先読み300s込み）と 15時台。sim_time は PREP_TIME(=1200s) が 0時。
+#   6時 = 1200+6*3600 = 22800 / 7時 = 26400
+#  15時 = 1200+15*3600 = 55200 / 16時 = 58800
+# 窓の頭は車列が育っていないため、300s のリードインを付けて記録を始める。
+_TSWIN_DEFAULT = "22500-26400,54900-58800"
+
+
+def _parse_windows(spec):
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        a, b = part.split("-")
+        out.append((int(a), int(b)))
+    return sorted(out)
+
+
+MEASURE_WINDOWS = _parse_windows(os.environ.get("R2_TSWIN", _TSWIN_DEFAULT))
+MEASURE_START = min(w[0] for w in MEASURE_WINDOWS)   # 互換用（全窓の外枠）
+MEASURE_END   = max(w[1] for w in MEASURE_WINDOWS)
 MAX_MEASURE_VEHICLES = None  # Noneなら無制限、数値なら台数制限
+
+
+def _in_measure_window(t):
+    return any(a <= t <= b for a, b in MEASURE_WINDOWS)
+
+
+# 時間距離図と軌跡データの出力先（OUT_DIR 配下）
+TS_DIR = os.path.join(OUT_DIR, "時間距離図")
+os.makedirs(TS_DIR, exist_ok=True)
+TS_TRACE_CSV = os.path.join(TS_DIR, "軌跡ログ.csv")        # 車両軌跡（あとから任意区間を再描画できる）
+TS_RED_CSV   = os.path.join(TS_DIR, "赤信号区間.csv")      # 交差点ごとの赤時間帯
+TS_JSEC_CSV  = os.path.join(TS_DIR, "J毎秒_待ち遅れ.csv")  # サイクル特定用のJ毎秒データ
 
 DEFAULT_INTERVAL = 120
 DEFAULT_MAX_N = 5
@@ -1056,6 +1115,17 @@ completed_north = set()
 signal_red_intervals = defaultdict(list)   # {交差点名: [[start, end], ...]}
 red_active_states = {}                     # {交差点名: bool}
 
+# --- 軌跡はメモリに溜めず CSV へ逐次書き出す ---
+# 24h分をメモリに持つと数百MBになるため。CSV に残すことで、
+# 走行後に任意のサイクル区間だけを切り出して再描画できる。
+_ts_trace_f = open(TS_TRACE_CSV, "w", newline="", encoding="utf-8-sig")
+_ts_trace_w = csv.writer(_ts_trace_f)
+_ts_trace_w.writerow(["dir", "sim_time", "veh", "edge", "pos", "x"])
+
+_ts_jsec_f = open(TS_JSEC_CSV, "w", newline="", encoding="utf-8-sig")
+_ts_jsec_w = csv.writer(_ts_jsec_f)
+_ts_jsec_w.writerow(["sim_time", "J待ち台数", "J遅れ(秒)"])
+
 
 # ===============================
 # ログ取得関数
@@ -1066,7 +1136,7 @@ def log_vehicle_positions(sim_time):
     global vehicle_traces, completed_south, completed_north
     global signal_red_intervals, red_active_states
 
-    if sim_time < MEASURE_START or sim_time > MEASURE_END:
+    if not _in_measure_window(sim_time):
         return
 
     # === 各交差点の赤時間を監視 ===
@@ -1128,17 +1198,23 @@ def log_vehicle_positions(sim_time):
                 enter_time_north[veh_id] = sim_time
                 measured_north.add(veh_id)
 
-        # 南方向の記録
+        # 南方向の記録（x = 南端からの累積距離。CSV へ逐次出力）
         if veh_id in measured_south and edge_id in south_edge_set:
             pos = traci.vehicle.getLanePosition(veh_id)
-            vehicle_traces[veh_id].append(("south", sim_time, edge_id, pos))
+            x = convert_x_south({"edge": edge_id, "pos": pos})
+            if x is not None:
+                _ts_trace_w.writerow(["south", int(sim_time), veh_id, edge_id,
+                                      round(pos, 1), round(x, 1)])
             if edge_id == SOUTH_COMPLETE_EDGE:
                 completed_south.add(veh_id)
 
         # 北方向の記録
         if veh_id in measured_north and edge_id in north_edge_set:
             pos = traci.vehicle.getLanePosition(veh_id)
-            vehicle_traces[veh_id].append(("north", sim_time, edge_id, pos))
+            x = convert_x_north({"edge": edge_id, "pos": pos})
+            if x is not None:
+                _ts_trace_w.writerow(["north", int(sim_time), veh_id, edge_id,
+                                      round(pos, 1), round(x, 1)])
             if edge_id == NORTH_COMPLETE_EDGE:
                 completed_north.add(veh_id)
 
@@ -1171,61 +1247,79 @@ def convert_x_north(row):
 # ===============================
 # プロット関数
 # ===============================
-def plot_time_space_diagram():
-    # === デバッグ診断 ===
-    print(f"\n[DEBUG] measured_north の車両数: {len(measured_north)}")
-    print(f"[DEBUG] NORTH_START_EDGE: {NORTH_START_EDGE}")
-    print(f"[DEBUG] NORTH_EDGES (先頭5): {NORTH_EDGES[:5]}")
-    print(f"[DEBUG] NORTH_EDGE_X_MAP エントリ数: {len(NORTH_EDGE_X_MAP)}")
-    print(f"[DEBUG] NORTH_EDGE_X_MAP (先頭3): {list(NORTH_EDGE_X_MAP.items())[:3]}")
-    for veh_id in list(measured_north)[:3]:
-        records = [r for r in vehicle_traces[veh_id] if r[0] == "north"]
-        edges_used = list(dict.fromkeys(r[2] for r in records))
-        in_map = [e for e in edges_used if e in NORTH_EDGE_X_MAP]
-        print(f"[DEBUG] 車両 {veh_id}: north記録={len(records)}件, エッジ={edges_used[:5]}, マップ一致={in_map[:5]}")
-    # ==================
+def _hhmm(sim_time):
+    """sim_time[s] を時刻表記に直す（PREP_TIME が 0時0分）。"""
+    t = int(sim_time) - PREP_TIME
+    return f"{t // 3600}時{(t % 3600) // 60:02d}分"
+
+
+def _close_ts_files():
+    """軌跡・毎秒データの CSV を閉じる（描画前に必ず呼ぶ）。"""
+    for f in (_ts_trace_f, _ts_jsec_f):
+        try:
+            f.flush(); f.close()
+        except Exception:
+            pass
+    # 赤信号区間を CSV へ（描画時に窓を切り出せるようにする）
+    with open(TS_RED_CSV, "w", newline="", encoding="utf-8-sig") as rf:
+        w = csv.writer(rf)
+        w.writerow(["交差点", "開始", "終了"])
+        for name, ivs in signal_red_intervals.items():
+            for s, e in ivs:
+                w.writerow([name, int(s), int(e) if e is not None else int(MEASURE_END)])
+    # 交差点の距離位置（別スクリプトから再描画するのに必要）
+    with open(os.path.join(TS_DIR, "交差点位置.csv"), "w", newline="",
+              encoding="utf-8-sig") as jf:
+        w = csv.writer(jf)
+        w.writerow(["交差点", "距離(m)"])
+        for entry in TL_ORDER:
+            label = entry[1]
+            if label in SIGNAL_INTERSECTIONS:
+                w.writerow([label, SIGNAL_INTERSECTIONS[label]])
+        w.writerow(["北端", sum(EDGE_LENGTHS[e] for e in SOUTH_EDGES)])
+
+
+def draw_time_space(t_from, t_to, out_png, title=None, mark=None):
+    """軌跡ログCSVから [t_from, t_to] を切り出して時間距離図を描く。
+
+    走行後に何度でも呼べる。mark=(開始,終了) を渡すと該当サイクルを強調する。
+    """
+    if not os.path.exists(TS_TRACE_CSV):
+        print(f"⚠ 軌跡ログがありません: {TS_TRACE_CSV}")
+        return None
+    tr = pd.read_csv(TS_TRACE_CSV, encoding="utf-8-sig")
+    tr = tr[(tr["sim_time"] >= t_from) & (tr["sim_time"] <= t_to)]
+    if tr.empty:
+        print(f"⚠ {t_from}〜{t_to}s に軌跡データがありません")
+        return None
 
     plt.figure(figsize=(14, 7))
+    for direction, color in (("south", "blue"), ("north", "green")):
+        sub = tr[tr["dir"] == direction]
+        for _, g in sub.groupby("veh"):
+            g = g.sort_values("sim_time")
+            plt.plot(g["x"], g["sim_time"], color=color, alpha=0.4, linewidth=0.8)
 
-    def draw_traces(df, color):
-        plt.plot(df["x"], df["sim_time"], color=color, alpha=0.4)
+    # 赤信号時間帯
+    if os.path.exists(TS_RED_CSV):
+        rd = pd.read_csv(TS_RED_CSV, encoding="utf-8-sig")
+        for name, x_pos in SIGNAL_INTERSECTIONS.items():
+            for _, r in rd[rd["交差点"] == name].iterrows():
+                s, e = max(r["開始"], t_from), min(r["終了"], t_to)
+                if s < e:
+                    plt.fill_betweenx([s, e], x_pos - 5, x_pos + 5, color="red", alpha=0.3)
 
-    # 南方向（P→A：A到達完了に限らず、P進入を検知した全車両をプロット）
-    for veh_id in measured_south:
-        if veh_id not in enter_time_south:
-            continue
-        records = [r for r in vehicle_traces[veh_id] if r[0] == "south"]
-        if not records:
-            continue
-        df = pd.DataFrame(records, columns=["dir", "sim_time", "edge", "pos"])
-        df["x"] = df.apply(convert_x_south, axis=1)
-        df = df.dropna(subset=["x"])
-        if df.empty:
-            continue
-        draw_traces(df, "blue")
+    # 対象サイクルの強調
+    if mark is not None:
+        for y in mark:
+            plt.axhline(y, color="orange", linestyle="--", linewidth=1.5)
 
-    # 北方向（A→P：P到達完了に限らず、A進入を検知した全車両をプロット）
-    for veh_id in measured_north:
-        if veh_id not in enter_time_north:
-            continue
-        records = [r for r in vehicle_traces[veh_id] if r[0] == "north"]
-        if not records:
-            continue
-        df = pd.DataFrame(records, columns=["dir", "sim_time", "edge", "pos"])
-        df["x"] = df.apply(convert_x_north, axis=1)
-        df = df.dropna(subset=["x"])
-        if df.empty:
-            continue
-        draw_traces(df, "green")
-
-    # 軸ラベル
     plt.xlabel("リンク距離 [m]")
-    plt.ylabel("シミュレーション時間 [s]")
-    plt.title("時間距離図（信号制御付き, シミュレーション時間基準）")
+    plt.ylabel("時刻")
+    plt.title(title or f"時間距離図（{_hhmm(t_from)}〜{_hhmm(t_to)}）")
 
-    # 主目盛り: 南端 → 各TL交差点 → 北端（TL_ORDER から自動生成）
     tick_positions = [0]
-    tick_labels    = [TL_ORDER[0][1]]  # 南端 = P交差点
+    tick_labels = [TL_ORDER[0][1]]
     for entry in TL_ORDER[1:]:
         label = entry[1]
         if label in SIGNAL_INTERSECTIONS:
@@ -1234,29 +1328,43 @@ def plot_time_space_diagram():
     total_south = sum(EDGE_LENGTHS[e] for e in SOUTH_EDGES)
     tick_positions.append(total_south)
     tick_labels.append("北端")
-
     plt.xticks(tick_positions, tick_labels)
     plt.grid(True, which="major", linestyle="--", alpha=0.6)
+    plt.ylim(t_from, t_to)
 
-    # 赤信号時間帯の描画（sim_time 基準）
-    for name, x_pos in SIGNAL_INTERSECTIONS.items():
-        if name in signal_red_intervals:
-            for start, end in signal_red_intervals[name]:
-                if end is None:
-                    end = MEASURE_END
-                plt.fill_betweenx([start, end],
-                                  x_pos - 5, x_pos + 5,
-                                  color="red", alpha=0.3)
+    # Y軸を 〇時〇分 表記にする
+    _ax = plt.gca()
+    _span = t_to - t_from
+    _step = 60 if _span <= 900 else (120 if _span <= 1800 else 300)
+    _first = PREP_TIME + ((int(t_from) - PREP_TIME + _step - 1) // _step) * _step
+    _ticks = list(range(_first, int(t_to) + 1, _step))
+    _ax.set_yticks(_ticks)
+    _ax.set_yticklabels([_hhmm(v) for v in _ticks])
 
-    # 凡例
     legend_lines = [
         plt.Line2D([0], [0], color="blue", lw=2, label="南→北"),
         plt.Line2D([0], [0], color="green", lw=2, label="北→南"),
-        plt.Rectangle((0, 0), 1, 1, color="red", alpha=0.3, label="赤信号")
+        plt.Rectangle((0, 0), 1, 1, color="red", alpha=0.3, label="赤信号"),
     ]
+    if mark is not None:
+        legend_lines.append(plt.Line2D([0], [0], color="orange", ls="--", lw=1.5,
+                                       label="対象サイクル"))
     plt.legend(handles=legend_lines)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+    print(f"✅ 時間距離図を保存: {out_png}")
+    return out_png
 
-    plt.show()
+
+def plot_time_space_diagram():
+    """計測窓ごとに時間距離図を保存する。細かい区間の抜き出しは
+    ★時間距離図_サイクル抽出.py で軌跡ログCSVから後追いできる。"""
+    _close_ts_files()
+    for a, b in MEASURE_WINDOWS:
+        h = (a - PREP_TIME) / 3600.0
+        draw_time_space(a, b, os.path.join(TS_DIR, f"時間距離図_{a}-{b}s.png"),
+                        title=f"時間距離図（{a}〜{b}s ≒ {h:.1f}時台, {CONTROL_MODE}）")
 # ============================================================================
 # ============================================================================
 
@@ -1936,7 +2044,16 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
     red2_tracker = red2.RedSplit2Tracker()
 
     sumoBinary = sumolib.checkBinary('sumo-gui' if USE_GUI else 'sumo')
-    traci.start([sumoBinary, "-c", sumocfg_path, "--start", "--quit-on-end"])
+    # R2_ROU で経路ファイル（＝日）を差し替えられる。複数日検証用。
+    # 指定しなければ sumocfg の route-files（= 1日目 と同じ内容）を使う。
+    _cmd = [sumoBinary, "-c", sumocfg_path, "--start", "--quit-on-end"]
+    _rou = os.environ.get("R2_ROU", "").strip()
+    if _rou:
+        if not os.path.exists(_rou):
+            raise FileNotFoundError(f"R2_ROU の経路ファイルが見つかりません: {_rou}")
+        _cmd += ["--route-files", _rou]
+        print(f"🚗 経路ファイルを差し替え: {_rou}")
+    traci.start(_cmd)
     sim_time = 0
     prev_states           = defaultdict(dict)
     pending_counts        = defaultdict(list)
@@ -2098,6 +2215,7 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
             _inwin = in_analysis_window(sim_time)
             _hour  = int((sim_time - PREP_TIME) // 3600)   # 時間帯（step_to_hourと同基準）
             _cur_stopped = defaultdict(set)
+            _j_delay_sec = 0                                  # このステップのJ遅れ
             for _veh in traci.vehicle.getIDList():
                 if traci.vehicle.getSpeed(_veh) <= 0:
                     _sig = edge_to_signal.get(traci.vehicle.getRoadID(_veh))
@@ -2109,7 +2227,9 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
                         delay_hour_all[_hour] += 1            # 時間帯別（街全体）
                         if _sig == TARGET_SIGNAL:
                             delay_hour_J[_hour] += 1          # 時間帯別（J）
+                            _j_delay_sec += 1
             # 待ち台数=延べ停車台数: 新規に停車した車だけ計上（前ステップに無かった車）
+            _j_queue_sec = 0                                  # このステップのJ待ち台数
             for _sig, _s in _cur_stopped.items():
                 _new = len(_s - signal_stopped_prev.get(_sig, _EMPTY_SET))
                 if _new:
@@ -2119,7 +2239,10 @@ def run_simulation(sumocfg_path, log_dir_path, control_signal=True):
                     queue_hour_all[_hour] += _new             # 時間帯別（街全体）
                     if _sig == TARGET_SIGNAL:
                         queue_hour_J[_hour] += _new           # 時間帯別（J）
+                        _j_queue_sec = _new
             signal_stopped_prev = _cur_stopped
+            # サイクル単位の集計は走行後に行うため、毎秒の値をそのまま残す
+            _ts_jsec_w.writerow([int(sim_time), _j_queue_sec, _j_delay_sec])
 
         # === 時間帯別サイクル長の切替（目標が変わった時だけ全対象信号を差し替え）===
         _target_cycle = red2.get_target_cycle(sim_time, PREP_TIME)
